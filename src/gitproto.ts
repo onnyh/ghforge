@@ -197,8 +197,8 @@ interface FetchPlan {
   needsAck: boolean;
 }
 
-/** Multi-source BFS distances (in commits) from the want tips. */
-function wantDistances(forge: Forge, repo: RepoRec, wants: string[]): Map<string, number> {
+/** Multi-source BFS distances (in commits) from the want tips, capped at `cap`. */
+function wantDistances(forge: Forge, repo: RepoRec, wants: string[], cap = Number.POSITIVE_INFINITY): Map<string, number> {
   const dist = new Map<string, number>();
   const queue: string[] = [];
   for (const want of wants) {
@@ -210,11 +210,13 @@ function wantDistances(forge: Forge, repo: RepoRec, wants: string[]): Map<string
   }
   while (queue.length > 0) {
     const oid = queue.shift()!;
+    const d = dist.get(oid)!;
+    if (d >= cap) continue;
     const view = forge.commitView(repo, oid);
     if (view === undefined) continue;
     for (const parent of view.parents) {
       if (!dist.has(parent)) {
-        dist.set(parent, dist.get(oid)! + 1);
+        dist.set(parent, d + 1);
         queue.push(parent);
       }
     }
@@ -263,7 +265,6 @@ function planFetch(
   const haveSet = new Set(haves.filter((oid) => repo.objects.has(oid)));
   const commonHaves = haves.filter((oid) => haveSet.has(oid));
   const haveClosure = clientPossession(forge, repo, haves, shallowReported);
-  const dist = wantDistances(forge, repo, wants);
 
   // A deepen request names the total depth from the want tips: depth 1 is
   // the tips alone, depth 2 adds exactly their parents, and so on — whether
@@ -272,6 +273,7 @@ function planFetch(
   if (deepen !== undefined) {
     limit = deepen - 1;
   }
+  const dist = wantDistances(forge, repo, wants, limit);
 
   const included = new Set<string>();
   const visited = new Set<string>();
