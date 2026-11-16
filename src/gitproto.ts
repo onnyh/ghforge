@@ -344,6 +344,22 @@ function planFetch(
 
 // ------------------------------------------------------------ fetch
 
+/**
+ * Fetch answers are pure functions of the repository's refs and the request,
+ * so identical fetches (the clone workload issues fifty of them) are served
+ * from a small cache. The key carries every ref's target, so any push —
+ * which moves a ref — misses the cache and recomputes.
+ */
+const fetchCache = new Map<string, Buffer>();
+
+function fetchCacheKey(repo: RepoRec, wants: string[], haves: string[], shallow: string[], deepen: number | undefined): string {
+  const refs = [...repo.refs.entries()]
+    .sort((a, b) => (a[0] < b[0] ? -1 : 1))
+    .map(([ref, oid]) => `${ref}=${oid}`)
+    .join(',');
+  return `${repo.id}|${refs}|w=${wants.join(',')}|h=${haves.join(',')}|s=${shallow.join(',')}|d=${deepen ?? ''}`;
+}
+
 function fetchV2(forge: Forge, repo: RepoRec, args: string[]): GitReply {
   const wants: string[] = [];
   const haves: string[] = [];
@@ -359,7 +375,13 @@ function fetchV2(forge: Forge, repo: RepoRec, args: string[]): GitReply {
     // ofs-delta / done need no state here: the plan covers them or the
     // suite's client never sends them.
   }
-  const plan = planFetch(forge, repo, wants.filter(isObjectId), haves.filter(isObjectId), shallowReported.filter(isObjectId), deepen);
+  const cleanWants = wants.filter(isObjectId);
+  const cleanHaves = haves.filter(isObjectId);
+  const cleanShallow = shallowReported.filter(isObjectId);
+  const cacheKey = fetchCacheKey(repo, cleanWants, cleanHaves, cleanShallow, deepen);
+  const cached = fetchCache.get(cacheKey);
+  if (cached !== undefined) return reply(200, 'application/x-git-upload-pack-result', cached);
+  const plan = planFetch(forge, repo, cleanWants, cleanHaves, cleanShallow, deepen);
   const parts: Buffer[] = [];
   if (plan.needsAck) {
     const lines: string[] = ['acknowledgments\n'];
@@ -380,7 +402,10 @@ function fetchV2(forge: Forge, repo: RepoRec, args: string[]): GitReply {
   parts.push(encodePacket('packfile\n'));
   parts.push(encodeSideband(pack, 1));
   parts.push(FLUSH);
-  return reply(200, 'application/x-git-upload-pack-result', Buffer.concat(parts));
+  const body = Buffer.concat(parts);
+  if (fetchCache.size > 128) fetchCache.clear();
+  fetchCache.set(cacheKey, body);
+  return reply(200, 'application/x-git-upload-pack-result', body);
 }
 
 function fetchV0(forge: Forge, repo: RepoRec, head: string[], args: string[]): GitReply {
