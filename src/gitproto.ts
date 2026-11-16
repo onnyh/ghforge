@@ -222,6 +222,36 @@ function wantDistances(forge: Forge, repo: RepoRec, wants: string[]): Map<string
   return dist;
 }
 
+/**
+ * What the client already holds: the closure of its haves and its shallow
+ * boundary, except that a shallow boundary commit's history is NOT held —
+ * traversal includes the boundary commit and its trees but never descends
+ * to its parents.
+ */
+function clientPossession(forge: Forge, repo: RepoRec, haves: string[], shallow: string[]): Set<string> {
+  const cut = new Set(shallow);
+  const seen = new Set<string>();
+  const queue: string[] = [];
+  for (const oid of [...haves, ...shallow]) if (repo.objects.has(oid)) queue.push(oid);
+  while (queue.length > 0) {
+    const oid = queue.pop()!;
+    if (seen.has(oid)) continue;
+    const object = repo.objects.get(oid);
+    if (object === undefined) continue;
+    seen.add(oid);
+    if (object.type === 'commit') {
+      const view = parseCommit(object.data);
+      queue.push(view.tree);
+      if (!cut.has(oid)) for (const parent of view.parents) queue.push(parent);
+    } else if (object.type === 'tag') {
+      queue.push(parseTag(object.data).object);
+    } else if (object.type === 'tree') {
+      for (const entry of parseTree(object.data)) if (entry.mode !== '160000') queue.push(entry.oid);
+    }
+  }
+  return seen;
+}
+
 function planFetch(
   forge: Forge,
   repo: RepoRec,
@@ -232,36 +262,19 @@ function planFetch(
 ): FetchPlan {
   const haveSet = new Set(haves.filter((oid) => repo.objects.has(oid)));
   const commonHaves = haves.filter((oid) => haveSet.has(oid));
-  const haveClosure = forge.closure(repo, haveSet);
+  const haveClosure = clientPossession(forge, repo, haves, shallowReported);
   const dist = wantDistances(forge, repo, wants);
 
+  // A deepen request names the total depth from the want tips: depth 1 is
+  // the tips alone, depth 2 adds exactly their parents, and so on — whether
+  // the clone is fresh or the fetch deepens an existing shallow boundary.
   let limit = Number.POSITIVE_INFINITY;
   if (deepen !== undefined) {
-    if (shallowReported.length > 0) {
-      const bases = shallowReported.map((oid) => dist.get(oid)).filter((value): value is number => value !== undefined);
-      const base = bases.length > 0 ? Math.min(...bases) : 0;
-      limit = base + deepen;
-    } else {
-      limit = deepen - 1;
-    }
-  }
-
-  // Objects the client already holds through its shallow boundary: the
-  // boundary commits and their trees (their histories stay behind).
-  const boundaryHeld = new Set<string>();
-  if (deepen === undefined && shallowReported.length > 0) {
-    for (const oid of shallowReported) {
-      const object = repo.objects.get(oid);
-      if (object === undefined) continue;
-      boundaryHeld.add(oid);
-      if (object.type === 'commit') {
-        const view = parseCommit(object.data);
-        for (const inner of forge.closure(repo, [view.tree])) boundaryHeld.add(inner);
-      }
-    }
+    limit = deepen - 1;
   }
 
   const included = new Set<string>();
+  const visited = new Set<string>();
   const queue: string[] = [];
   for (const want of wants) if (repo.objects.has(want)) queue.push(want);
   const commitIncluded = (oid: string): boolean => {
@@ -270,16 +283,25 @@ function planFetch(
   };
   while (queue.length > 0) {
     const oid = queue.pop()!;
-    if (included.has(oid) || haveClosure.has(oid) || boundaryHeld.has(oid)) continue;
+    if (visited.has(oid)) continue;
+    visited.add(oid);
     const object = repo.objects.get(oid);
     if (object === undefined) continue;
-    if (object.type === 'commit' && !commitIncluded(oid)) continue;
-    included.add(oid);
     if (object.type === 'commit') {
-      const view = parseCommit(object.data);
-      queue.push(view.tree);
-      for (const parent of view.parents) queue.push(parent);
-    } else if (object.type === 'tag') {
+      if (!commitIncluded(oid)) continue;
+      // A held commit (a have, or the shallow boundary) is not re-sent, but
+      // the walk continues through it: a deepen request reaches the history
+      // below the boundary the client already holds.
+      if (!haveClosure.has(oid)) {
+        included.add(oid);
+        queue.push(parseCommit(object.data).tree);
+      }
+      for (const parent of parseCommit(object.data).parents) queue.push(parent);
+      continue;
+    }
+    if (haveClosure.has(oid)) continue;
+    included.add(oid);
+    if (object.type === 'tag') {
       queue.push(parseTag(object.data).object);
     } else if (object.type === 'tree') {
       for (const entry of parseTree(object.data)) if (entry.mode !== '160000') queue.push(entry.oid);
